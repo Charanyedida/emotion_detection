@@ -1,5 +1,6 @@
 """
-Real-time Emotion Detection Application
+AI-Powered Driver Emotion and Stress Monitoring System
+Real-time facial emotion and stress detection for accident prevention.
 Uses webcam feed with DenseNet-based model for facial emotion recognition.
 """
 
@@ -10,6 +11,8 @@ import argparse
 import logging
 from datetime import datetime
 from pathlib import Path
+from collections import deque
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -46,22 +49,57 @@ FACE_MIN_NEIGHBORS = 5
 CONFIDENCE_THRESHOLD = 0.3  # Minimum confidence to display prediction
 INPUT_SIZE = (48, 48)
 
+# Stress detection parameters
+STRESS_EMOTION_WEIGHTS = {
+    'Angry': 0.9,
+    'Fear': 0.85,
+    'Sad': 0.75,
+    'Disgust': 0.7,
+    'Contempt': 0.65,
+    'Surprise': 0.4,  # Can be positive or negative
+    'Neutral': 0.1,
+    'Happy': -0.3  # Reduces stress
+}
+
+STRESS_LEVELS = {
+    'LOW': (0.0, 0.3),
+    'MODERATE': (0.3, 0.6),
+    'HIGH': (0.6, 0.85),
+    'CRITICAL': (0.85, 1.0)
+}
+
+STRESS_COLORS = {
+    'LOW': (0, 255, 0),        # Green
+    'MODERATE': (0, 255, 255),  # Yellow
+    'HIGH': (0, 165, 255),      # Orange
+    'CRITICAL': (0, 0, 255)     # Red
+}
+
+# Safety parameters
+HIGH_STRESS_THRESHOLD = 0.7  # Trigger alert at this stress level
+CRITICAL_STRESS_THRESHOLD = 0.85  # Trigger safety stop at this level
+STRESS_WINDOW_SIZE = 30  # Number of frames to average stress over
+HIGH_STRESS_DURATION_THRESHOLD = 3.0  # Seconds of high stress before stop
+
 
 class EmotionDetector:
-    """Real-time emotion detection from webcam feed."""
+    """AI-powered driver emotion and stress monitoring system for accident prevention."""
 
-    def __init__(self, model_path: str, camera_id: int = 0, save_frames: bool = False):
+    def __init__(self, model_path: str, camera_id: int = 0, save_frames: bool = False,
+                 enable_safety_stop: bool = True):
         """
-        Initialize the emotion detector.
+        Initialize the emotion and stress detector.
 
         Args:
             model_path: Path to the trained Keras model file
             camera_id: Camera device ID (default: 0)
             save_frames: Whether to save detected emotion frames
+            enable_safety_stop: Enable automatic safety stop on critical stress
         """
         self.model_path = Path(model_path)
         self.camera_id = camera_id
         self.save_frames = save_frames
+        self.enable_safety_stop = enable_safety_stop
         self.model = None
         self.cap = None
         self.face_cascade = None
@@ -72,6 +110,19 @@ class EmotionDetector:
         # Statistics tracking
         self.emotion_counts = {label: 0 for label in CLASS_LABELS.values()}
         self.total_detections = 0
+
+        # Stress monitoring
+        self.stress_history = deque(maxlen=STRESS_WINDOW_SIZE)
+        self.current_stress_level = 0.0
+        self.stress_level_label = 'LOW'
+        self.high_stress_start_time = None
+        self.safety_stop_active = False
+        self.stress_level_counts = {level: 0 for level in STRESS_LEVELS.keys()}
+        self.total_stress_readings = 0
+
+        # Model compatibility info
+        self.model_input_size = INPUT_SIZE  # Will be updated after model load
+        self.model_num_classes = len(CLASS_LABELS)  # Will be updated after model load
 
         # Output directory for saved frames
         if save_frames:
@@ -87,10 +138,78 @@ class EmotionDetector:
 
             logger.info(f"Loading model from {self.model_path}...")
             self.model = tf.keras.models.load_model(str(self.model_path), compile=False)
+            
+            # Validate model compatibility
+            if not self._validate_model():
+                return False
+            
             logger.info("Model loaded successfully!")
+            logger.info(f"Model input shape: {self.model.input_shape}")
+            logger.info(f"Model output shape: {self.model.output_shape}")
+            logger.info(f"Number of output classes: {self.model.output_shape[-1]}")
             return True
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
+            logger.error(f"Error details: {type(e).__name__}: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+    
+    def _validate_model(self) -> bool:
+        """Validate that the model is compatible with the detection system."""
+        try:
+            # Check if model has input and output
+            if self.model is None:
+                logger.error("Model is None")
+                return False
+            
+            # Check input shape
+            input_shape = self.model.input_shape
+            if input_shape is None or len(input_shape) < 3:
+                logger.error(f"Invalid model input shape: {input_shape}")
+                return False
+            
+            # Check output shape
+            output_shape = self.model.output_shape
+            if output_shape is None or len(output_shape) < 1:
+                logger.error(f"Invalid model output shape: {output_shape}")
+                return False
+            
+            num_classes = output_shape[-1]
+            if num_classes != len(CLASS_LABELS):
+                logger.warning(f"Model has {num_classes} classes but expected {len(CLASS_LABELS)} classes")
+                logger.warning("The model may use different emotion labels. Proceeding with caution...")
+            
+            # Test prediction with dummy data
+            test_input_shape = input_shape[1:]  # Remove batch dimension
+            if len(test_input_shape) == 3:
+                h, w, c = test_input_shape
+                test_input = np.zeros((1, h, w, c), dtype=np.float32)
+            else:
+                logger.error(f"Unexpected input shape format: {input_shape}")
+                return False
+            
+            try:
+                test_output = self.model.predict(test_input, verbose=0)
+                if test_output is None or len(test_output.shape) < 2:
+                    logger.error(f"Model prediction returned invalid output shape: {test_output.shape if test_output is not None else None}")
+                    return False
+                
+                # Store model info for later use
+                if len(input_shape) >= 3:
+                    self.model_input_size = (input_shape[2], input_shape[1])  # (width, height)
+                self.model_num_classes = output_shape[-1]
+                
+                logger.info("Model validation successful!")
+                return True
+            except Exception as pred_error:
+                logger.error(f"Model prediction test failed: {pred_error}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                return False
+                
+        except Exception as e:
+            logger.error(f"Model validation error: {e}")
             return False
 
     def initialize_camera(self) -> bool:
@@ -130,18 +249,48 @@ class EmotionDetector:
         Returns:
             Preprocessed face array ready for model prediction
         """
-        # Extract and resize ROI
-        roi = gray_frame[y:y+h, x:x+w]
-        roi = cv2.resize(roi, INPUT_SIZE)
+        try:
+            # Extract and resize ROI
+            roi = gray_frame[y:y+h, x:x+w]
+            
+            # Get expected input size from model
+            if hasattr(self, 'model_input_size') and self.model_input_size:
+                target_size = self.model_input_size
+            elif self.model and self.model.input_shape:
+                model_input_shape = self.model.input_shape[1:3]  # Get height, width (skip batch and channels)
+                target_size = (model_input_shape[1], model_input_shape[0])  # (width, height) for cv2.resize
+            else:
+                target_size = INPUT_SIZE
+            
+            roi = cv2.resize(roi, target_size)
 
-        # Convert to RGB (DenseNet expects 3 channels)
-        roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+            # Check if model expects RGB or grayscale
+            if self.model and self.model.input_shape:
+                expected_channels = self.model.input_shape[-1]
+                if expected_channels == 3:
+                    # Convert to RGB (DenseNet expects 3 channels)
+                    roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+                elif expected_channels == 1:
+                    # Keep grayscale, add channel dimension
+                    roi = np.expand_dims(roi, axis=-1)
+            else:
+                # Default: convert to RGB
+                roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
 
-        # Normalize and add batch dimension
-        roi = roi.astype("float32") / 255.0
-        roi = np.expand_dims(roi, axis=0)
+            # Normalize and add batch dimension
+            roi = roi.astype("float32") / 255.0
+            roi = np.expand_dims(roi, axis=0)
 
-        return roi
+            return roi
+        except Exception as e:
+            logger.debug(f"Preprocessing error: {e}")
+            # Fallback to default preprocessing
+            roi = gray_frame[y:y+h, x:x+w]
+            roi = cv2.resize(roi, INPUT_SIZE)
+            roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+            roi = roi.astype("float32") / 255.0
+            roi = np.expand_dims(roi, axis=0)
+            return roi
 
     def predict_emotion(self, face_roi: np.ndarray) -> tuple[str, float, np.ndarray]:
         """
@@ -153,17 +302,157 @@ class EmotionDetector:
         Returns:
             Tuple of (emotion_label, confidence, all_predictions)
         """
-        predictions = self.model.predict(face_roi, verbose=0)[0]
-        emotion_idx = np.argmax(predictions)
-        emotion_label = CLASS_LABELS[emotion_idx]
-        confidence = float(predictions[emotion_idx])
+        try:
+            # Get predictions
+            pred_output = self.model.predict(face_roi, verbose=0)
+            
+            # Handle different output formats
+            if isinstance(pred_output, list):
+                predictions = pred_output[0]
+            else:
+                predictions = pred_output
+            
+            # Handle batch dimension
+            if len(predictions.shape) > 1:
+                predictions = predictions[0]
+            
+            # Ensure predictions is a numpy array
+            predictions = np.array(predictions).flatten()
+            
+            # Validate number of classes
+            num_classes = len(predictions)
+            expected_classes = len(CLASS_LABELS)
+            
+            if num_classes != expected_classes:
+                logger.warning(f"Model output has {num_classes} classes but expected {expected_classes}")
+                # If model has fewer classes, pad with zeros
+                if num_classes < expected_classes:
+                    predictions = np.pad(predictions, (0, expected_classes - num_classes), 'constant')
+                # If model has more classes, truncate
+                elif num_classes > expected_classes:
+                    predictions = predictions[:expected_classes]
+                    logger.warning(f"Truncated predictions from {num_classes} to {expected_classes} classes")
+            
+            # Get emotion with highest confidence
+            emotion_idx = int(np.argmax(predictions))
+            
+            # Ensure index is valid
+            if emotion_idx >= len(CLASS_LABELS):
+                emotion_idx = emotion_idx % len(CLASS_LABELS)
+                logger.warning(f"Emotion index {emotion_idx} out of range, using {emotion_idx % len(CLASS_LABELS)}")
+            
+            emotion_label = CLASS_LABELS[emotion_idx]
+            confidence = float(predictions[emotion_idx])
+            
+            # Ensure confidence is valid
+            if np.isnan(confidence) or np.isinf(confidence):
+                confidence = 0.0
+                logger.warning("Invalid confidence value, setting to 0.0")
 
-        return emotion_label, confidence, predictions
+            return emotion_label, confidence, predictions
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # Return default values on error
+            return 'Neutral', 0.0, np.zeros(len(CLASS_LABELS))
+
+    def calculate_stress_level(self, emotion: str, confidence: float, predictions: np.ndarray) -> float:
+        """
+        Calculate stress level based on detected emotions.
+
+        Args:
+            emotion: Detected emotion label
+            confidence: Prediction confidence
+            predictions: All emotion predictions
+
+        Returns:
+            Stress level (0.0 to 1.0)
+        """
+        try:
+            # Calculate weighted stress score from all emotions
+            stress_score = 0.0
+            total_weight = 0.0
+
+            for idx, label in CLASS_LABELS.items():
+                weight = STRESS_EMOTION_WEIGHTS.get(label, 0.0)
+                prob = float(predictions[idx])
+                
+                # Add weighted contribution (positive weights increase stress, negative decrease it)
+                stress_score += weight * prob
+                total_weight += abs(weight) * prob
+
+            # Normalize stress score
+            if total_weight > 0.001:  # Avoid division by very small numbers
+                normalized_stress = stress_score / total_weight
+            else:
+                normalized_stress = 0.0
+
+            # Map normalized stress to [0, 1] range
+            # Since weights range from -0.3 (Happy) to 0.9 (Angry)
+            # normalized_stress will range approximately from -0.3 to 0.9
+            # We need to map this to [0, 1]
+            # Formula: (value - min) / (max - min) = (value + 0.3) / 1.2
+            stress_score = (normalized_stress + 0.3) / 1.2
+            
+            # Clamp to [0, 1] range to ensure valid values
+            stress_score = max(0.0, min(1.0, stress_score))
+
+            # Add to history for smoothing
+            self.stress_history.append(stress_score)
+
+            # Calculate average stress over window
+            if len(self.stress_history) > 0:
+                avg_stress = float(np.mean(list(self.stress_history)))
+            else:
+                avg_stress = stress_score
+
+            # Ensure valid float (handle NaN or Inf)
+            if np.isnan(avg_stress) or np.isinf(avg_stress):
+                avg_stress = 0.0
+
+            return float(avg_stress)
+        except Exception as e:
+            logger.debug(f"Error calculating stress level: {e}")
+            return 0.0
+
+    def get_stress_level_label(self, stress_level: float) -> str:
+        """Get stress level label based on stress value."""
+        for level, (low, high) in STRESS_LEVELS.items():
+            if low <= stress_level < high:
+                return level
+        return 'CRITICAL'  # Default for values >= 1.0
+
+    def check_safety_stop(self, stress_level: float) -> bool:
+        """
+        Check if safety stop should be triggered based on stress level.
+
+        Args:
+            stress_level: Current stress level
+
+        Returns:
+            True if safety stop should be triggered
+        """
+        if not self.enable_safety_stop:
+            return False
+
+        current_time = time.time()
+
+        if stress_level >= CRITICAL_STRESS_THRESHOLD:
+            if self.high_stress_start_time is None:
+                self.high_stress_start_time = current_time
+            elif current_time - self.high_stress_start_time >= HIGH_STRESS_DURATION_THRESHOLD:
+                return True
+        else:
+            self.high_stress_start_time = None
+
+        return False
 
     def draw_detection(self, frame: np.ndarray, x: int, y: int, w: int, h: int,
-                       emotion: str, confidence: float, predictions: np.ndarray) -> None:
+                       emotion: str, confidence: float, predictions: np.ndarray,
+                       stress_level: float = None) -> None:
         """
-        Draw detection results on the frame.
+        Draw detection results on the frame including stress information.
 
         Args:
             frame: Video frame to draw on
@@ -171,11 +460,19 @@ class EmotionDetector:
             emotion: Detected emotion label
             confidence: Prediction confidence
             predictions: All emotion predictions for probability bars
+            stress_level: Current stress level (optional)
         """
         color = EMOTION_COLORS.get(emotion, (255, 255, 255))
 
-        # Draw face bounding box
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        # Draw face bounding box with thickness based on stress
+        box_thickness = 2
+        if stress_level is not None:
+            if stress_level >= CRITICAL_STRESS_THRESHOLD:
+                box_thickness = 5
+            elif stress_level >= HIGH_STRESS_THRESHOLD:
+                box_thickness = 4
+
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, box_thickness)
 
         # Draw emotion label with confidence
         label_text = f"{emotion} {int(confidence * 100)}%"
@@ -186,8 +483,20 @@ class EmotionDetector:
         cv2.putText(frame, label_text, (x + 5, y - 7),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+        # Draw stress level if available
+        if stress_level is not None:
+            stress_label = self.get_stress_level_label(stress_level)
+            stress_color = STRESS_COLORS.get(stress_label, (255, 255, 255))
+            stress_text = f"Stress: {stress_label} ({int(stress_level * 100)}%)"
+            stress_size, _ = cv2.getTextSize(stress_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            
+            # Background for stress label
+            cv2.rectangle(frame, (x, y + h + 2), (x + stress_size[0] + 10, y + h + 25), stress_color, -1)
+            cv2.putText(frame, stress_text, (x + 5, y + h + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         # Draw emotion probability bars (mini visualization)
-        bar_start_y = y + h + 5
+        bar_start_y = y + h + (30 if stress_level is not None else 5)
         bar_height = 8
         bar_width = w
 
@@ -205,7 +514,7 @@ class EmotionDetector:
             cv2.rectangle(frame, (x, bar_y), (x + bar_length, bar_y + bar_height), bar_color, -1)
 
     def draw_hud(self, frame: np.ndarray) -> None:
-        """Draw heads-up display with FPS and controls."""
+        """Draw heads-up display with FPS, stress level, and safety status."""
         height, width = frame.shape[:2]
 
         # Semi-transparent overlay for HUD
@@ -219,15 +528,43 @@ class EmotionDetector:
         cv2.putText(overlay, f"Detections: {self.total_detections}", (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
+        # Stress level display
+        stress_color = STRESS_COLORS.get(self.stress_level_label, (255, 255, 255))
+        stress_text = f"Stress: {self.stress_level_label} ({int(self.current_stress_level * 100)}%)"
+        cv2.putText(overlay, stress_text, (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, stress_color, 2)
+
+        # Stress level bar
+        bar_x, bar_y = 10, 95
+        bar_width, bar_height = 200, 20
+        cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+        bar_fill_width = int(self.current_stress_level * bar_width)
+        cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_fill_width, bar_y + bar_height), stress_color, -1)
+        cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
+
+        # Safety status
+        y_offset = 125
+        if self.safety_stop_active:
+            cv2.putText(overlay, "SAFETY STOP ACTIVE!", (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+            # Blinking effect
+            if int(time.time() * 2) % 2 == 0:
+                cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 255), 10)
+        elif self.current_stress_level >= HIGH_STRESS_THRESHOLD:
+            warning_text = f"WARNING: High Stress Detected!"
+            cv2.putText(overlay, warning_text, (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
         # Controls help
         controls = [
             "Q - Quit",
             "S - Screenshot",
             "R - Reset Stats",
-            "P - Pause"
+            "P - Pause",
+            "T - Toggle Safety Stop"
         ]
         for i, ctrl in enumerate(controls):
-            cv2.putText(overlay, ctrl, (width - 130, 25 + i * 20),
+            cv2.putText(overlay, ctrl, (width - 150, 25 + i * 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         # Blend overlay
@@ -252,18 +589,21 @@ class EmotionDetector:
         logger.debug(f"Saved detection: {filename}")
 
     def print_statistics(self) -> None:
-        """Print detection statistics summary."""
-        print("\n" + "=" * 50)
-        print("EMOTION DETECTION STATISTICS")
-        print("=" * 50)
+        """Print detection statistics summary including stress analysis."""
+        print("\n" + "=" * 60)
+        print("AI-POWERED DRIVER EMOTION & STRESS MONITORING REPORT")
+        print("=" * 60)
 
         if self.total_detections == 0:
             print("No emotions detected during this session.")
             return
 
-        print(f"Total detections: {self.total_detections}\n")
+        print(f"\nTotal detections: {self.total_detections}")
+        print(f"Total stress readings: {self.total_stress_readings}\n")
 
-        # Sort emotions by count
+        # Emotion statistics
+        print("EMOTION DETECTION STATISTICS:")
+        print("-" * 60)
         sorted_emotions = sorted(self.emotion_counts.items(), key=lambda x: x[1], reverse=True)
 
         for emotion, count in sorted_emotions:
@@ -271,7 +611,30 @@ class EmotionDetector:
             bar = "█" * int(percentage / 5)
             print(f"{emotion:10s} | {bar:20s} | {count:4d} ({percentage:5.1f}%)")
 
-        print("=" * 50)
+        # Stress statistics
+        if self.total_stress_readings > 0:
+            print("\nSTRESS LEVEL STATISTICS:")
+            print("-" * 60)
+            sorted_stress = sorted(self.stress_level_counts.items(), 
+                                 key=lambda x: STRESS_LEVELS[x[0]][0])
+
+            for level, count in sorted_stress:
+                percentage = (count / self.total_stress_readings) * 100
+                bar = "█" * int(percentage / 5)
+                color_indicator = "🔴" if level == "CRITICAL" else "🟠" if level == "HIGH" else "🟡" if level == "MODERATE" else "🟢"
+                print(f"{color_indicator} {level:10s} | {bar:20s} | {count:4d} ({percentage:5.1f}%)")
+
+            # Safety events
+            print("\nSAFETY ANALYSIS:")
+            print("-" * 60)
+            high_stress_count = self.stress_level_counts.get('HIGH', 0) + self.stress_level_counts.get('CRITICAL', 0)
+            if high_stress_count > 0:
+                print(f"⚠️  High/Critical stress events: {high_stress_count}")
+                print(f"⚠️  Safety stop triggered: {'Yes' if self.safety_stop_active else 'No'}")
+            else:
+                print("✅ No high stress events detected - Safe driving session")
+
+        print("=" * 60)
 
     def run(self) -> None:
         """Main detection loop."""
@@ -281,7 +644,8 @@ class EmotionDetector:
         if not self.initialize_camera():
             return
 
-        logger.info("Starting emotion detection... Press 'Q' to quit.")
+        logger.info("Starting AI-powered driver emotion and stress monitoring system...")
+        logger.info("Press 'Q' to quit, 'T' to toggle safety stop")
         paused = False
 
         try:
@@ -310,7 +674,27 @@ class EmotionDetector:
                             emotion, confidence, predictions = self.predict_emotion(face_roi)
 
                             if confidence >= CONFIDENCE_THRESHOLD:
-                                self.draw_detection(frame, x, y, w, h, emotion, confidence, predictions)
+                                # Calculate stress level (with error handling)
+                                try:
+                                    stress_level = self.calculate_stress_level(emotion, confidence, predictions)
+                                    self.current_stress_level = stress_level
+                                    self.stress_level_label = self.get_stress_level_label(stress_level)
+                                    
+                                    # Update stress statistics
+                                    self.stress_level_counts[self.stress_level_label] += 1
+                                    self.total_stress_readings += 1
+
+                                    # Check for safety stop
+                                    if self.check_safety_stop(stress_level):
+                                        self.safety_stop_active = True
+                                        logger.warning(f"SAFETY STOP ACTIVATED - Critical stress detected: {stress_level:.2f}")
+
+                                    # Draw detection with stress information
+                                    self.draw_detection(frame, x, y, w, h, emotion, confidence, predictions, stress_level)
+                                except Exception as stress_error:
+                                    # If stress calculation fails, still draw emotion detection
+                                    logger.debug(f"Stress calculation error: {stress_error}")
+                                    self.draw_detection(frame, x, y, w, h, emotion, confidence, predictions, None)
 
                                 # Update statistics
                                 self.emotion_counts[emotion] += 1
@@ -320,7 +704,7 @@ class EmotionDetector:
                                 if self.save_frames:
                                     self.save_detection(frame, emotion)
                         except Exception as e:
-                            logger.debug(f"Face processing error: {e}")
+                            logger.warning(f"Face processing error: {e}", exc_info=True)
                             continue
 
                     # Update HUD
@@ -328,7 +712,10 @@ class EmotionDetector:
                     self.draw_hud(frame)
 
                     # Display frame
-                    cv2.imshow('Emotion Detector', frame)
+                    window_title = 'Driver Emotion & Stress Monitor'
+                    if self.safety_stop_active:
+                        window_title += ' - SAFETY STOP ACTIVE!'
+                    cv2.imshow(window_title, frame)
 
                 # Handle keyboard input
                 key = cv2.waitKey(1) & 0xFF
@@ -350,6 +737,12 @@ class EmotionDetector:
                     # Toggle pause
                     paused = not paused
                     logger.info("Paused" if paused else "Resumed")
+                elif key == ord('t'):
+                    # Toggle safety stop
+                    self.enable_safety_stop = not self.enable_safety_stop
+                    if not self.enable_safety_stop:
+                        self.safety_stop_active = False
+                    logger.info(f"Safety stop {'enabled' if self.enable_safety_stop else 'disabled'}")
 
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
@@ -368,7 +761,7 @@ class EmotionDetector:
 def main():
     """Entry point with argument parsing."""
     parser = argparse.ArgumentParser(
-        description="Real-time Emotion Detection using Webcam",
+        description="AI-Powered Driver Emotion and Stress Monitoring System for Accident Prevention",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Controls:
@@ -376,12 +769,20 @@ Controls:
   S - Take a screenshot
   R - Reset statistics
   P - Pause/Resume detection
+  T - Toggle safety stop feature
+
+Safety Features:
+  - Real-time stress level monitoring
+  - High stress warnings
+  - Automatic safety stop on critical stress levels
+  - Driver safety statistics and reporting
 
 Examples:
   python main.py                           # Use default camera and model
   python main.py --camera 1                # Use camera ID 1
   python main.py --save-frames             # Save detected emotion frames
   python main.py --model custom_model.keras  # Use custom model
+  python main.py --no-safety-stop          # Disable automatic safety stop
         """
     )
 
