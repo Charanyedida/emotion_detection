@@ -1,12 +1,17 @@
 # AI-Powered Driver Emotion and Stress Monitoring System
 
-Real-time facial emotion and stress detection using webcam with a DenseNet-based deep learning model. Designed for driver monitoring and accident prevention.
+Real-time facial emotion and stress detection using webcam with either:
+- **DeepFace backend** (default) for plug-and-play emotion analysis
+- **Custom Keras model backend** (DenseNet-based), reused from `main.py`
 
 ## Features
 
 ### Emotion Detection
 - **Real-time Detection** - Processes webcam feed and detects emotions frame-by-frame
 - **8 Emotion Classes** - Angry, Contempt, Disgust, Fear, Happy, Neutral, Sad, Surprise
+- **Backends**:
+  - **DeepFace** – default, no training required
+  - **Custom Keras model** – your own `.keras` model (DenseNet-based)
 - **Visual Feedback** - Color-coded bounding boxes with probability bars
 - **Statistics Tracking** - Session-wide emotion detection statistics
 - **Screenshot Capture** - Save frames on demand
@@ -23,43 +28,54 @@ Real-time facial emotion and stress detection using webcam with a DenseNet-based
 ## Requirements
 
 ```
-tensorflow
+tensorflow          # for custom Keras backend
 opencv-python
 numpy
+deepface            # for DeepFace backend
 ```
 
 ## Usage
 
-### Basic Usage
+### Basic Usage (DeepFace backend, default)
 
 ```bash
 python main.py
+```
+
+### Using Custom Keras Model Backend
+
+```bash
+python main.py --backend custom --model best_emotion_model.keras
 ```
 
 ### CLI Arguments
 
 | Argument | Short | Default | Description |
 |----------|-------|---------|-------------|
-| `--model` | `-m` | `best_emotion_model.keras` | Path to the trained Keras model file |
+| `--backend` | `-b` | `deepface` | Backend to use: `deepface` or `custom` |
+| `--model` | `-m` | `best_emotion_model.keras` | Path to the trained Keras model file (used when `--backend custom`) |
 | `--camera` | `-c` | `0` | Camera device ID |
-| `--save-frames` | `-s` | `False` | Save frames with detected emotions to `detected_emotions/` |
+| `--save-frames` | `-s` | `False` | Save frames with detected emotions (`detected_emotions/` or `detected_emotions_deepface/`) |
 | `--verbose` | `-v` | `False` | Enable verbose/debug logging |
 | `--no-safety-stop` | | `False` | Disable automatic safety stop on critical stress |
 
 ### Examples
 
 ```bash
-# Use default settings
+# Use default settings (DeepFace backend)
 python main.py
 
-# Use a different camera
+# Use DeepFace with a different camera
 python main.py --camera 1
 
-# Save all detected emotion frames
+# Save all detected emotion frames (DeepFace backend)
 python main.py --save-frames
 
-# Use a custom model
-python main.py --model path/to/custom_model.keras
+# Use a custom Keras model backend
+python main.py --backend custom --model path/to/custom_model.keras
+
+# Use a different Keras model and disable safety stop
+python main.py --backend custom --model final_emotion_model.keras --no-safety-stop
 
 # Enable verbose logging
 python main.py -v

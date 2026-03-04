@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import deque
 import time
+from deepface import DeepFace
 
 # Configure logging
 logging.basicConfig(
@@ -758,10 +759,489 @@ class EmotionDetector:
         logger.info("Cleanup complete")
 
 
+class DeepFaceDriverMonitor:
+    """Driver monitoring using DeepFace for emotion + stress, with safety stop."""
+
+    def __init__(
+        self,
+        camera_id: int = 0,
+        analysis_interval: float = 1.0,
+        save_frames: bool = False,
+        enable_safety_stop: bool = True,
+    ) -> None:
+        self.camera_id = camera_id
+        self.analysis_interval = analysis_interval
+        self.save_frames = save_frames
+        self.enable_safety_stop = enable_safety_stop
+
+        self.cap: cv2.VideoCapture | None = None
+        self.frame_count = 0
+        self.fps = 0.0
+        self.last_fps_time = datetime.now()
+
+        # Stats
+        self.emotion_counts = {label: 0 for label in CLASS_LABELS.values()}
+        self.total_detections = 0
+
+        # Stress
+        self.stress_history = deque(maxlen=STRESS_WINDOW_SIZE)
+        self.current_stress_level = 0.0
+        self.stress_level_label = "LOW"
+        self.high_stress_start_time: float | None = None
+        self.safety_stop_active = False
+        self.stress_level_counts = {level: 0 for level in STRESS_LEVELS.keys()}
+        self.total_stress_readings = 0
+
+        # DeepFace state
+        self.last_analysis_time = 0.0
+        self.current_emotion = "Analyzing..."
+        self.current_confidence = 0.0
+        self.current_predictions = np.zeros(len(CLASS_LABELS), dtype=np.float32)
+        self.current_region: dict | None = None
+
+        # Output directory
+        if save_frames:
+            self.output_dir = Path("detected_emotions_deepface")
+            self.output_dir.mkdir(exist_ok=True)
+        else:
+            self.output_dir = None
+
+    def _map_deepface_emotions(self, df_emotions: dict) -> np.ndarray:
+        """Map DeepFace emotion dict to our CLASS_LABELS vector."""
+        key_map = {
+            "angry": "Angry",
+            "disgust": "Disgust",
+            "fear": "Fear",
+            "fearful": "Fear",
+            "happy": "Happy",
+            "sad": "Sad",
+            "surprise": "Surprise",
+            "surprised": "Surprise",
+            "neutral": "Neutral",
+            "contempt": "Contempt",
+        }
+
+        scores = {label: 0.0 for label in CLASS_LABELS.values()}
+
+        for k, v in df_emotions.items():
+            try:
+                mapped = key_map.get(k.lower())
+                if mapped is not None and mapped in scores:
+                    scores[mapped] = float(v)
+            except Exception:
+                continue
+
+        vec = np.array([scores[label] for label in CLASS_LABELS.values()], dtype=np.float32)
+        total = float(vec.sum())
+        if total > 1e-6:
+            vec /= total
+        return vec
+
+    def calculate_stress_level(self, predictions: np.ndarray) -> float:
+        """Weighted stress calculation using predictions vector."""
+        try:
+            stress_score = 0.0
+            total_weight = 0.0
+            for idx, label in CLASS_LABELS.items():
+                weight = STRESS_EMOTION_WEIGHTS.get(label, 0.0)
+                prob = float(predictions[idx])
+                stress_score += weight * prob
+                total_weight += abs(weight) * prob
+
+            if total_weight > 0.001:
+                normalized_stress = stress_score / total_weight
+            else:
+                normalized_stress = 0.0
+
+            stress_score = (normalized_stress + 0.3) / 1.2
+            stress_score = max(0.0, min(1.0, stress_score))
+
+            self.stress_history.append(stress_score)
+            if self.stress_history:
+                avg_stress = float(np.mean(list(self.stress_history)))
+            else:
+                avg_stress = stress_score
+
+            if np.isnan(avg_stress) or np.isinf(avg_stress):
+                avg_stress = 0.0
+
+            return avg_stress
+        except Exception as e:
+            logger.debug(f"Error calculating stress level (DeepFace): {e}")
+            return 0.0
+
+    def get_stress_level_label(self, stress_level: float) -> str:
+        for level, (low, high) in STRESS_LEVELS.items():
+            if low <= stress_level < high:
+                return level
+        return "CRITICAL"
+
+    def check_safety_stop(self, stress_level: float) -> bool:
+        if not self.enable_safety_stop:
+            return False
+
+        now = time.time()
+        if stress_level >= CRITICAL_STRESS_THRESHOLD:
+            if self.high_stress_start_time is None:
+                self.high_stress_start_time = now
+            elif now - self.high_stress_start_time >= HIGH_STRESS_DURATION_THRESHOLD:
+                return True
+        else:
+            self.high_stress_start_time = None
+        return False
+
+    def draw_detection(
+        self,
+        frame: np.ndarray,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+    ) -> None:
+        """Draw bounding box + labels using current emotion/stress state."""
+        emotion = self.current_emotion
+        confidence = self.current_confidence
+        predictions = self.current_predictions
+        stress_level = self.current_stress_level
+
+        color = EMOTION_COLORS.get(emotion.capitalize(), (255, 255, 255))
+
+        box_thickness = 2
+        if stress_level >= CRITICAL_STRESS_THRESHOLD:
+            box_thickness = 5
+        elif stress_level >= HIGH_STRESS_THRESHOLD:
+            box_thickness = 4
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, box_thickness)
+
+        label_text = f"{emotion.capitalize()} {int(confidence * 100)}%"
+        label_size, _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(frame, (x, y - 25), (x + label_size[0] + 10, y), color, -1)
+        cv2.putText(
+            frame,
+            label_text,
+            (x + 5, y - 7),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+        )
+
+        stress_label = self.stress_level_label
+        stress_color = STRESS_COLORS.get(stress_label, (255, 255, 255))
+        stress_text = f"Stress: {stress_label} ({int(stress_level * 100)}%)"
+        stress_size, _ = cv2.getTextSize(stress_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(
+            frame,
+            (x, y + h + 2),
+            (x + stress_size[0] + 10, y + h + 25),
+            stress_color,
+            -1,
+        )
+        cv2.putText(
+            frame,
+            stress_text,
+            (x + 5, y + h + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+
+        bar_start_y = y + h + 30
+        bar_height = 8
+        bar_width = w
+        for i, (idx, label) in enumerate(CLASS_LABELS.items()):
+            if i >= 4:
+                break
+            prob = float(predictions[idx])
+            bar_length = int(prob * bar_width)
+            bar_y = bar_start_y + i * (bar_height + 2)
+            cv2.rectangle(
+                frame, (x, bar_y), (x + bar_width, bar_y + bar_height), (50, 50, 50), -1
+            )
+            bar_color = EMOTION_COLORS.get(label, (255, 255, 255))
+            cv2.rectangle(
+                frame,
+                (x, bar_y),
+                (x + bar_length, bar_y + bar_height),
+                bar_color,
+                -1,
+            )
+
+    def draw_hud(self, frame: np.ndarray) -> None:
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+
+        cv2.putText(
+            overlay,
+            f"FPS: {self.fps:.1f}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            overlay,
+            f"Detections: {self.total_detections}",
+            (10, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+        )
+
+        stress_color = STRESS_COLORS.get(self.stress_level_label, (255, 255, 255))
+        stress_text = f"Stress: {self.stress_level_label} ({int(self.current_stress_level * 100)}%)"
+        cv2.putText(
+            overlay,
+            stress_text,
+            (10, 80),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            stress_color,
+            2,
+        )
+
+        bar_x, bar_y = 10, 95
+        bar_width, bar_height = 200, 20
+        cv2.rectangle(
+            overlay, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1
+        )
+        bar_fill_width = int(self.current_stress_level * bar_width)
+        cv2.rectangle(
+            overlay,
+            (bar_x, bar_y),
+            (bar_x + bar_fill_width, bar_y + bar_height),
+            stress_color,
+            -1,
+        )
+        cv2.rectangle(
+            overlay,
+            (bar_x, bar_y),
+            (bar_x + bar_width, bar_y + bar_height),
+            (255, 255, 255),
+            2,
+        )
+
+        y_offset = 125
+        if self.safety_stop_active:
+            cv2.putText(
+                overlay,
+                "SAFETY STOP ACTIVE!",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                3,
+            )
+            if int(time.time() * 2) % 2 == 0:
+                cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), 10)
+        elif self.current_stress_level >= HIGH_STRESS_THRESHOLD:
+            cv2.putText(
+                overlay,
+                "WARNING: High Stress Detected!",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 165, 255),
+                2,
+            )
+
+        controls = [
+            "Q - Quit",
+            "S - Screenshot",
+            "R - Reset Stats",
+            "P - Pause",
+            "T - Toggle Safety Stop",
+        ]
+        for i, ctrl in enumerate(controls):
+            cv2.putText(
+                overlay,
+                ctrl,
+                (w - 200, 25 + i * 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (200, 200, 200),
+                1,
+            )
+
+        cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
+
+    def calculate_fps(self) -> None:
+        self.frame_count += 1
+        now = datetime.now()
+        elapsed = (now - self.last_fps_time).total_seconds()
+        if elapsed >= 1.0:
+            self.fps = self.frame_count / elapsed
+            self.frame_count = 0
+            self.last_fps_time = now
+
+    def save_detection(self, frame: np.ndarray, emotion: str) -> None:
+        if not self.output_dir:
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = self.output_dir / f"{emotion}_{ts}.jpg"
+        cv2.imwrite(str(filename), frame)
+        logger.debug(f"Saved detection (DeepFace): {filename}")
+
+    def run(self) -> None:
+        self.cap = cv2.VideoCapture(self.camera_id)
+        if not self.cap.isOpened():
+            logger.error(f"Failed to open camera {self.camera_id}")
+            return
+
+        logger.info(
+            "Starting DeepFace-based driver emotion & stress monitor "
+            "(backend=deepface). Press 'Q' to quit."
+        )
+
+        paused = False
+        try:
+            while True:
+                if not paused:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        logger.warning("Failed to capture frame")
+                        break
+
+                    frame = cv2.flip(frame, 1)
+                    now = time.time()
+
+                    # Run DeepFace analysis at lower frequency
+                    if now - self.last_analysis_time >= self.analysis_interval:
+                        try:
+                            analysis = DeepFace.analyze(
+                                frame,
+                                actions=["emotion"],
+                                enforce_detection=False,
+                            )
+                            if isinstance(analysis, list):
+                                analysis = analysis[0]
+
+                            df_emotions = analysis.get("emotion", {})
+                            region = analysis.get("region", None)
+                            dominant = str(analysis.get("dominant_emotion", "neutral"))
+
+                            preds = self._map_deepface_emotions(df_emotions)
+                            self.current_predictions = preds
+
+                            # Map dominant label to CLASS_LABELS index
+                            dominant_key = dominant.lower()
+                            if dominant_key == "surprised":
+                                dominant_key = "surprise"
+                            if dominant_key == "fearful":
+                                dominant_key = "fear"
+
+                            emotion_idx = 0
+                            for idx, label in CLASS_LABELS.items():
+                                if label.lower() == dominant_key:
+                                    emotion_idx = idx
+                                    break
+
+                            self.current_emotion = CLASS_LABELS[emotion_idx]
+                            self.current_confidence = float(preds[emotion_idx])
+
+                            # Stress updates
+                            stress_level = self.calculate_stress_level(preds)
+                            self.current_stress_level = stress_level
+                            self.stress_level_label = self.get_stress_level_label(stress_level)
+                            self.stress_level_counts[self.stress_level_label] += 1
+                            self.total_stress_readings += 1
+
+                            if self.check_safety_stop(stress_level):
+                                self.safety_stop_active = True
+                                logger.warning(
+                                    f"SAFETY STOP ACTIVATED - Critical stress: {stress_level:.2f}"
+                                )
+
+                            self.total_detections += 1
+                            self.emotion_counts[self.current_emotion] += 1
+
+                            if region and all(k in region for k in ("x", "y", "w", "h")):
+                                self.current_region = region
+                            else:
+                                self.current_region = None
+
+                            self.last_analysis_time = now
+                        except Exception as e:
+                            logger.debug(f"DeepFace analysis error: {e}")
+
+                    # Draw detection if we have a region
+                    if self.current_region:
+                        x = int(self.current_region.get("x", 0))
+                        y = int(self.current_region.get("y", 0))
+                        w = int(self.current_region.get("w", 100))
+                        h = int(self.current_region.get("h", 100))
+                        h_img, w_img = frame.shape[:2]
+                        x = max(0, min(x, w_img - 1))
+                        y = max(0, min(y, h_img - 1))
+                        w = max(10, min(w, w_img - x))
+                        h = max(10, min(h, h_img - y))
+                        self.draw_detection(frame, x, y, w, h)
+                    else:
+                        cv2.putText(
+                            frame,
+                            f"Emotion: {self.current_emotion} ({int(self.current_confidence * 100)}%)",
+                            (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.0,
+                            (0, 255, 0),
+                            2,
+                        )
+
+                    self.calculate_fps()
+                    self.draw_hud(frame)
+
+                    title = "Driver Emotion & Stress Monitor (DeepFace)"
+                    if self.safety_stop_active:
+                        title += " - SAFETY STOP ACTIVE!"
+                    cv2.imshow(title, frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    logger.info("Quit requested by user")
+                    break
+                elif key == ord("s"):
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    cv2.imwrite(f"deepface_screenshot_{ts}.jpg", frame)
+                    logger.info(f"Screenshot saved: deepface_screenshot_{ts}.jpg")
+                elif key == ord("r"):
+                    self.emotion_counts = {label: 0 for label in CLASS_LABELS.values()}
+                    self.total_detections = 0
+                    self.stress_level_counts = {level: 0 for level in STRESS_LEVELS.keys()}
+                    self.total_stress_readings = 0
+                    self.stress_history.clear()
+                    logger.info("Statistics reset")
+                elif key == ord("p"):
+                    paused = not paused
+                    logger.info("Paused" if paused else "Resumed")
+                elif key == ord("t"):
+                    self.enable_safety_stop = not self.enable_safety_stop
+                    if not self.enable_safety_stop:
+                        self.safety_stop_active = False
+                    logger.info(
+                        f"Safety stop {'enabled' if self.enable_safety_stop else 'disabled'}"
+                    )
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        finally:
+            if self.cap is not None:
+                self.cap.release()
+            cv2.destroyAllWindows()
+            logger.info("DeepFace driver monitor cleanup complete")
+
+
 def main():
-    """Entry point with argument parsing."""
+    """CLI entrypoint with backend selection: deepface | custom."""
     parser = argparse.ArgumentParser(
-        description="AI-Powered Driver Emotion and Stress Monitoring System for Accident Prevention",
+        description=(
+            "AI-Powered Driver Emotion & Stress Monitoring (DeepFace or Custom Model)\n"
+            "- DeepFace backend: uses DeepFace for emotion, with stress & safety stop.\n"
+            "- Custom backend: uses Keras model via EmotionDetector."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Controls:
@@ -778,35 +1258,51 @@ Safety Features:
   - Driver safety statistics and reporting
 
 Examples:
-  python main.py                           # Use default camera and model
-  python main.py --camera 1                # Use camera ID 1
-  python main.py --save-frames             # Save detected emotion frames
-  python main.py --model custom_model.keras  # Use custom model
-  python main.py --no-safety-stop          # Disable automatic safety stop
-        """
+  python main.py                           # DeepFace backend (default)
+  python main.py --backend deepface        # Explicit DeepFace backend
+  python main.py --backend custom --model best_emotion_model.keras
+  python main.py --backend custom --model final_emotion_model.keras --no-safety-stop
+        """,
     )
 
     parser.add_argument(
-        '--model', '-m',
+        "--backend",
+        "-b",
         type=str,
-        default='best_emotion_model.keras',
-        help='Path to the trained Keras model file (default: best_emotion_model.keras)'
+        choices=["deepface", "custom"],
+        default="deepface",
+        help="Which backend to use: 'deepface' (default) or 'custom' Keras model",
     )
     parser.add_argument(
-        '--camera', '-c',
+        "--model",
+        "-m",
+        type=str,
+        default="best_emotion_model.keras",
+        help="Path to the trained Keras model file (used only when backend='custom')",
+    )
+    parser.add_argument(
+        "--camera",
+        "-c",
         type=int,
         default=0,
-        help='Camera device ID (default: 0)'
+        help="Camera device ID (default: 0)",
     )
     parser.add_argument(
-        '--save-frames', '-s',
-        action='store_true',
-        help='Save frames with detected emotions to disk'
+        "--save-frames",
+        "-s",
+        action="store_true",
+        help="Save frames with detected emotions to disk",
     )
     parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Enable verbose logging'
+        "--no-safety-stop",
+        action="store_true",
+        help="Disable automatic safety stop on critical stress",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging",
     )
 
     args = parser.parse_args()
@@ -814,13 +1310,22 @@ Examples:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Create and run detector
-    detector = EmotionDetector(
-        model_path=args.model,
-        camera_id=args.camera,
-        save_frames=args.save_frames
-    )
-    detector.run()
+    if args.backend == "deepface":
+        monitor = DeepFaceDriverMonitor(
+            camera_id=args.camera,
+            analysis_interval=1.0,
+            save_frames=args.save_frames,
+            enable_safety_stop=not args.no_safety_stop,
+        )
+        monitor.run()
+    else:
+        detector = EmotionDetector(
+            model_path=args.model,
+            camera_id=args.camera,
+            save_frames=args.save_frames,
+            enable_safety_stop=not args.no_safety_stop,
+        )
+        detector.run()
 
 
 if __name__ == "__main__":
