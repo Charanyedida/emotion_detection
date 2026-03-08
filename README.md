@@ -52,7 +52,7 @@ tensorflow          # for custom Keras backend
 opencv-python
 numpy
 deepface            # for DeepFace backend
-simpleaudio         # for audio alerts (cross-platform)
+pygame              # for audio alerts (.mp3/.wav, cross-platform)
 mediapipe           # for drowsiness (eye/face landmarks)
 ```
 
@@ -81,8 +81,10 @@ python main.py --backend custom --model best_emotion_model.keras
 | `--verbose` | `-v` | `False` | Enable verbose/debug logging |
 | `--no-safety-stop` | | `False` | Disable automatic safety stop on critical stress |
 | `--no-audio-alerts` | | `False` | Disable audio alerts for stress and drowsiness |
-| `--audio-high` | | `None` | Path to a custom `.wav` file for high-stress alerts |
-| `--audio-drowsy` | | `None` | Path to a custom `.wav` file for drowsiness alerts |
+| `--audio-high` | | `None` | Path to a custom `.mp3` or `.wav` file for high-stress alerts |
+| `--audio-drowsy` | | `None` | Path to a custom `.mp3` or `.wav` file for drowsiness alerts |
+
+*Note: If `alarm_audio.mp3` is present in the current directory and no custom flags are provided, the system will default to using it for both alerts instead of generating synthetic beeps.*
 
 ### Examples
 
