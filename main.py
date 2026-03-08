@@ -14,6 +14,16 @@ from pathlib import Path
 from collections import deque
 import time
 from deepface import DeepFace
+import mediapipe as mp
+import os
+import urllib.request
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+try:
+    import simpleaudio as _sa
+except ImportError:
+    _sa = None
 
 # Configure logging
 logging.basicConfig(
@@ -83,11 +93,194 @@ STRESS_WINDOW_SIZE = 30  # Number of frames to average stress over
 HIGH_STRESS_DURATION_THRESHOLD = 3.0  # Seconds of high stress before stop
 
 
+class DrowsinessState:
+    AWAKE = "AWAKE"
+    DROWSY = "DROWSY"
+    ASLEEP = "ASLEEP"
+
+
+class AudioAlertManager:
+    """
+    Cross-platform audio alert helper using simpleaudio when available.
+    Plays short beeps for:
+      - High/critical stress
+      - Drowsiness / sleeping
+    """
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        min_interval_high_stress: float = 2.0,
+        min_interval_drowsy: float = 2.0,
+    ) -> None:
+        self.enabled = enabled and (_sa is not None)
+        self.min_interval_high_stress = min_interval_high_stress
+        self.min_interval_drowsy = min_interval_drowsy
+        self._last_high_stress_play = 0.0
+        self._last_drowsy_play = 0.0
+
+        # Pre-generate a short beep tone (440 Hz, 300 ms)
+        self._wave_obj_high = None
+        self._wave_obj_drowsy = None
+
+        if self.enabled:
+            try:
+                sample_rate = 44100
+                duration_s = 0.3
+                t = np.linspace(0, duration_s, int(sample_rate * duration_s), False)
+
+                # High-stress: higher pitch, louder
+                tone_high = 0.8 * np.sin(2 * np.pi * 880 * t)
+                audio_high = np.int16(tone_high * 32767)
+
+                # Drowsy: lower pitch, slightly softer
+                tone_drowsy = 0.6 * np.sin(2 * np.pi * 440 * t)
+                audio_drowsy = np.int16(tone_drowsy * 32767)
+
+                self._wave_obj_high = _sa.WaveObject(
+                    audio_high.tobytes(), 1, 2, sample_rate
+                )
+                self._wave_obj_drowsy = _sa.WaveObject(
+                    audio_drowsy.tobytes(), 1, 2, sample_rate
+                )
+            except Exception as e:
+                logger.warning(f"Audio initialization failed, disabling alerts: {e}")
+                self.enabled = False
+
+    def _can_play(self, last_play_time: float, min_interval: float) -> bool:
+        now = time.time()
+        return now - last_play_time >= min_interval
+
+    def play_high_stress_alert(self) -> None:
+        """Play an alert sound for high/critical stress."""
+        if not self.enabled or self._wave_obj_high is None:
+            return
+        if not self._can_play(self._last_high_stress_play, self.min_interval_high_stress):
+            return
+        try:
+            self._wave_obj_high.play()
+            self._last_high_stress_play = time.time()
+        except Exception as e:
+            logger.debug(f"High-stress audio alert failed: {e}")
+
+    def play_drowsy_alert(self) -> None:
+        """Play an alert sound when driver is drowsy/sleeping."""
+        if not self.enabled or self._wave_obj_drowsy is None:
+            return
+        if not self._can_play(self._last_drowsy_play, self.min_interval_drowsy):
+            return
+        try:
+            self._wave_obj_drowsy.play()
+            self._last_drowsy_play = time.time()
+        except Exception as e:
+            logger.debug(f"Drowsy audio alert failed: {e}")
+
+
+class DrowsinessDetector:
+    """
+    Drowsiness detector based on eye aspect ratio (EAR) from MediaPipe face mesh landmarks.
+    """
+
+    def __init__(
+        self,
+        ear_drowsy_threshold: float = 0.23,
+        ear_sleep_threshold: float = 0.18,
+    ) -> None:
+        self.ear_drowsy_threshold = ear_drowsy_threshold
+        self.ear_sleep_threshold = ear_sleep_threshold
+
+        model_path = "face_landmarker.task"
+        if not os.path.exists(model_path):
+            logger.info("Downloading face_landmarker.task model for MediaPipe...")
+            url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+            try:
+                urllib.request.urlretrieve(url, model_path)
+                logger.info("Download complete.")
+            except Exception as e:
+                logger.error(f"Failed to download MediaPipe model: {e}")
+
+        try:
+            base_options = mp_python.BaseOptions(model_asset_path=model_path)
+            options = vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
+            self._detector = vision.FaceLandmarker.create_from_options(options)
+        except Exception as e:
+            logger.error(f"Failed to initialize MediaPipe FaceLandmarker: {e}")
+            self._detector = None
+
+        # Approximate landmark indices for eyes (MediaPipe FaceMesh topology)
+        self._right_eye_idx = [33, 160, 158, 133, 153, 144]
+        self._left_eye_idx = [362, 385, 387, 263, 373, 380]
+
+    @staticmethod
+    def _euclidean_dist(p1, p2) -> float:
+        return float(np.linalg.norm(np.array(p1) - np.array(p2)))
+
+    def _eye_aspect_ratio(self, eye_points) -> float:
+        p1, p2, p3, p4, p5, p6 = eye_points
+        v1 = self._euclidean_dist(p2, p6)
+        v2 = self._euclidean_dist(p3, p5)
+        h = self._euclidean_dist(p1, p4)
+        if h <= 1e-6:
+            return 0.0
+        return float((v1 + v2) / (2.0 * h))
+
+    def analyze_frame(self, frame_bgr: np.ndarray) -> tuple[str, float]:
+        """
+        Analyze a BGR frame and return (state, confidence).
+        """
+        if not hasattr(self, '_detector') or self._detector is None:
+            return DrowsinessState.AWAKE, 0.0
+
+        height, width = frame_bgr.shape[:2]
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        result = self._detector.detect(mp_image)
+        
+        if not result.face_landmarks:
+            return DrowsinessState.AWAKE, 0.0
+
+        face_landmarks = result.face_landmarks[0]
+
+        def get_points(idx_list):
+            pts = []
+            for idx in idx_list:
+                lm = face_landmarks[idx]
+                pts.append((lm.x * width, lm.y * height))
+            return pts
+
+        right_eye_pts = get_points(self._right_eye_idx)
+        left_eye_pts = get_points(self._left_eye_idx)
+
+        ear_right = self._eye_aspect_ratio(right_eye_pts)
+        ear_left = self._eye_aspect_ratio(left_eye_pts)
+        ear = (ear_right + ear_left) / 2.0
+
+        if ear <= self.ear_sleep_threshold:
+            state = DrowsinessState.ASLEEP
+        elif ear <= self.ear_drowsy_threshold:
+            state = DrowsinessState.DROWSY
+        else:
+            state = DrowsinessState.AWAKE
+
+        # For now, treat confidence as 1.0 when not AWAKE
+        confidence = 1.0 if state != DrowsinessState.AWAKE else 0.0
+        return state, confidence
+
+
 class EmotionDetector:
     """AI-powered driver emotion and stress monitoring system for accident prevention."""
 
     def __init__(self, model_path: str, camera_id: int = 0, save_frames: bool = False,
-                 enable_safety_stop: bool = True):
+                 enable_safety_stop: bool = True, audio_manager: AudioAlertManager | None = None):
         """
         Initialize the emotion and stress detector.
 
@@ -101,6 +294,7 @@ class EmotionDetector:
         self.camera_id = camera_id
         self.save_frames = save_frames
         self.enable_safety_stop = enable_safety_stop
+        self.audio_manager = audio_manager
         self.model = None
         self.cap = None
         self.face_cascade = None
@@ -121,9 +315,23 @@ class EmotionDetector:
         self.stress_level_counts = {level: 0 for level in STRESS_LEVELS.keys()}
         self.total_stress_readings = 0
 
+        # High-stress audio timing
+        self.high_stress_audio_start_time = None
+
+        # Drowsiness audio timing
+        self.drowsy_audio_start_time = None
+        self.asleep_audio_start_time = None
+
         # Model compatibility info
         self.model_input_size = INPUT_SIZE  # Will be updated after model load
         self.model_num_classes = len(CLASS_LABELS)  # Will be updated after model load
+
+        # Drowsiness detection
+        self.drowsiness_detector = DrowsinessDetector()
+        self.drowsiness_state = DrowsinessState.AWAKE
+        self.drowsiness_confidence = 0.0
+        self.drowsy_start_time = None
+        self.asleep_start_time = None
 
         # Output directory for saved frames
         if save_frames:
@@ -373,7 +581,7 @@ class EmotionDetector:
         try:
             # Calculate weighted stress score from all emotions
             stress_score = 0.0
-            total_weight = 0.0
+            total_prob = 0.0
 
             for idx, label in CLASS_LABELS.items():
                 weight = STRESS_EMOTION_WEIGHTS.get(label, 0.0)
@@ -381,11 +589,11 @@ class EmotionDetector:
                 
                 # Add weighted contribution (positive weights increase stress, negative decrease it)
                 stress_score += weight * prob
-                total_weight += abs(weight) * prob
+                total_prob += prob
 
             # Normalize stress score
-            if total_weight > 0.001:  # Avoid division by very small numbers
-                normalized_stress = stress_score / total_weight
+            if total_prob > 0.001:  # Avoid division by very small numbers
+                normalized_stress = stress_score / total_prob
             else:
                 normalized_stress = 0.0
 
@@ -448,6 +656,57 @@ class EmotionDetector:
             self.high_stress_start_time = None
 
         return False
+
+    def handle_high_stress_audio(self, stress_level: float) -> None:
+        """
+        Trigger high-stress audio alert when stress has been high/critical
+        for a continuous duration.
+        """
+        if self.audio_manager is None or not self.audio_manager.enabled:
+            return
+
+        now = time.time()
+
+        if stress_level >= HIGH_STRESS_THRESHOLD:
+            if self.high_stress_audio_start_time is None:
+                self.high_stress_audio_start_time = now
+                return
+
+            duration = now - self.high_stress_audio_start_time
+            if duration >= HIGH_STRESS_DURATION_THRESHOLD:
+                self.audio_manager.play_high_stress_alert()
+        else:
+            self.high_stress_audio_start_time = None
+
+    def handle_drowsiness_audio(self, state: str) -> None:
+        """
+        Trigger drowsiness audio alert when driver is drowsy/asleep
+        for a continuous duration.
+        """
+        if self.audio_manager is None or not self.audio_manager.enabled:
+            return
+
+        now = time.time()
+
+        if state == DrowsinessState.DROWSY:
+            if self.drowsy_audio_start_time is None:
+                self.drowsy_audio_start_time = now
+                return
+            duration = now - self.drowsy_audio_start_time
+            if duration >= HIGH_STRESS_DURATION_THRESHOLD:
+                self.audio_manager.play_drowsy_alert()
+        else:
+            self.drowsy_audio_start_time = None
+
+        if state == DrowsinessState.ASLEEP:
+            if self.asleep_audio_start_time is None:
+                self.asleep_audio_start_time = now
+                return
+            duration = now - self.asleep_audio_start_time
+            if duration >= HIGH_STRESS_DURATION_THRESHOLD:
+                self.audio_manager.play_drowsy_alert()
+        else:
+            self.asleep_audio_start_time = None
 
     def draw_detection(self, frame: np.ndarray, x: int, y: int, w: int, h: int,
                        emotion: str, confidence: float, predictions: np.ndarray,
@@ -515,7 +774,7 @@ class EmotionDetector:
             cv2.rectangle(frame, (x, bar_y), (x + bar_length, bar_y + bar_height), bar_color, -1)
 
     def draw_hud(self, frame: np.ndarray) -> None:
-        """Draw heads-up display with FPS, stress level, and safety status."""
+        """Draw heads-up display with FPS, stress level, drowsiness, and safety status."""
         height, width = frame.shape[:2]
 
         # Semi-transparent overlay for HUD
@@ -543,8 +802,18 @@ class EmotionDetector:
         cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_fill_width, bar_y + bar_height), stress_color, -1)
         cv2.rectangle(overlay, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
 
+        # Drowsiness display
+        drowsy_text = f"Drowsiness: {self.drowsiness_state}"
+        drowsy_color = (0, 255, 0)
+        if self.drowsiness_state == DrowsinessState.DROWSY:
+            drowsy_color = (0, 255, 255)
+        elif self.drowsiness_state == DrowsinessState.ASLEEP:
+            drowsy_color = (0, 0, 255)
+        cv2.putText(overlay, drowsy_text, (10, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, drowsy_color, 2)
+
         # Safety status
-        y_offset = 125
+        y_offset = 155
         if self.safety_stop_active:
             cv2.putText(overlay, "SAFETY STOP ACTIVE!", (10, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
@@ -660,6 +929,14 @@ class EmotionDetector:
                     frame = cv2.flip(frame, 1)  # Mirror effect
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+                    # Drowsiness analysis (per frame)
+                    try:
+                        state, confidence = self.drowsiness_detector.analyze_frame(frame)
+                        self.drowsiness_state = state
+                        self.drowsiness_confidence = confidence
+                    except Exception as d_err:
+                        logger.debug(f"Drowsiness analysis error: {d_err}")
+
                     # Detect faces
                     faces = self.face_cascade.detectMultiScale(
                         gray,
@@ -690,6 +967,9 @@ class EmotionDetector:
                                         self.safety_stop_active = True
                                         logger.warning(f"SAFETY STOP ACTIVATED - Critical stress detected: {stress_level:.2f}")
 
+                                    # High-stress audio alert
+                                    self.handle_high_stress_audio(stress_level)
+
                                     # Draw detection with stress information
                                     self.draw_detection(frame, x, y, w, h, emotion, confidence, predictions, stress_level)
                                 except Exception as stress_error:
@@ -710,12 +990,12 @@ class EmotionDetector:
 
                     # Update HUD
                     self.calculate_fps()
+                    # Drowsiness audio based on latest state
+                    self.handle_drowsiness_audio(self.drowsiness_state)
                     self.draw_hud(frame)
 
                     # Display frame
                     window_title = 'Driver Emotion & Stress Monitor'
-                    if self.safety_stop_active:
-                        window_title += ' - SAFETY STOP ACTIVE!'
                     cv2.imshow(window_title, frame)
 
                 # Handle keyboard input
@@ -768,11 +1048,13 @@ class DeepFaceDriverMonitor:
         analysis_interval: float = 1.0,
         save_frames: bool = False,
         enable_safety_stop: bool = True,
+        audio_manager: AudioAlertManager | None = None,
     ) -> None:
         self.camera_id = camera_id
         self.analysis_interval = analysis_interval
         self.save_frames = save_frames
         self.enable_safety_stop = enable_safety_stop
+        self.audio_manager = audio_manager
 
         self.cap: cv2.VideoCapture | None = None
         self.frame_count = 0
@@ -791,6 +1073,20 @@ class DeepFaceDriverMonitor:
         self.safety_stop_active = False
         self.stress_level_counts = {level: 0 for level in STRESS_LEVELS.keys()}
         self.total_stress_readings = 0
+
+        # High-stress audio timing
+        self.high_stress_audio_start_time: float | None = None
+
+        # Drowsiness audio timing
+        self.drowsy_audio_start_time: float | None = None
+        self.asleep_audio_start_time: float | None = None
+
+        # Drowsiness detection
+        self.drowsiness_detector = DrowsinessDetector()
+        self.drowsiness_state = DrowsinessState.AWAKE
+        self.drowsiness_confidence = 0.0
+        self.drowsy_start_time: float | None = None
+        self.asleep_start_time: float | None = None
 
         # DeepFace state
         self.last_analysis_time = 0.0
@@ -841,15 +1137,15 @@ class DeepFaceDriverMonitor:
         """Weighted stress calculation using predictions vector."""
         try:
             stress_score = 0.0
-            total_weight = 0.0
+            total_prob = 0.0
             for idx, label in CLASS_LABELS.items():
                 weight = STRESS_EMOTION_WEIGHTS.get(label, 0.0)
                 prob = float(predictions[idx])
                 stress_score += weight * prob
-                total_weight += abs(weight) * prob
+                total_prob += prob
 
-            if total_weight > 0.001:
-                normalized_stress = stress_score / total_weight
+            if total_prob > 0.001:
+                normalized_stress = stress_score / total_prob
             else:
                 normalized_stress = 0.0
 
@@ -889,6 +1185,57 @@ class DeepFaceDriverMonitor:
         else:
             self.high_stress_start_time = None
         return False
+
+    def handle_high_stress_audio(self, stress_level: float) -> None:
+        """
+        Trigger high-stress audio alert when stress has been high/critical
+        for a continuous duration.
+        """
+        if self.audio_manager is None or not self.audio_manager.enabled:
+            return
+
+        now = time.time()
+
+        if stress_level >= HIGH_STRESS_THRESHOLD:
+            if self.high_stress_audio_start_time is None:
+                self.high_stress_audio_start_time = now
+                return
+
+            duration = now - self.high_stress_audio_start_time
+            if duration >= HIGH_STRESS_DURATION_THRESHOLD:
+                self.audio_manager.play_high_stress_alert()
+        else:
+            self.high_stress_audio_start_time = None
+
+    def handle_drowsiness_audio(self, state: str) -> None:
+        """
+        Trigger drowsiness audio alert when driver is drowsy/asleep
+        for a continuous duration.
+        """
+        if self.audio_manager is None or not self.audio_manager.enabled:
+            return
+
+        now = time.time()
+
+        if state == DrowsinessState.DROWSY:
+            if self.drowsy_audio_start_time is None:
+                self.drowsy_audio_start_time = now
+                return
+            duration = now - self.drowsy_audio_start_time
+            if duration >= HIGH_STRESS_DURATION_THRESHOLD:
+                self.audio_manager.play_drowsy_alert()
+        else:
+            self.drowsy_audio_start_time = None
+
+        if state == DrowsinessState.ASLEEP:
+            if self.asleep_audio_start_time is None:
+                self.asleep_audio_start_time = now
+                return
+            duration = now - self.asleep_audio_start_time
+            if duration >= HIGH_STRESS_DURATION_THRESHOLD:
+                self.audio_manager.play_drowsy_alert()
+        else:
+            self.asleep_audio_start_time = None
 
     def draw_detection(
         self,
@@ -1025,7 +1372,24 @@ class DeepFaceDriverMonitor:
             2,
         )
 
-        y_offset = 125
+        # Drowsiness display
+        drowsy_text = f"Drowsiness: {self.drowsiness_state}"
+        drowsy_color = (0, 255, 0)
+        if self.drowsiness_state == DrowsinessState.DROWSY:
+            drowsy_color = (0, 255, 255)
+        elif self.drowsiness_state == DrowsinessState.ASLEEP:
+            drowsy_color = (0, 0, 255)
+        cv2.putText(
+            overlay,
+            drowsy_text,
+            (10, 125),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            drowsy_color,
+            2,
+        )
+
+        y_offset = 155
         if self.safety_stop_active:
             cv2.putText(
                 overlay,
@@ -1109,6 +1473,14 @@ class DeepFaceDriverMonitor:
                     frame = cv2.flip(frame, 1)
                     now = time.time()
 
+                    # Drowsiness analysis (per frame)
+                    try:
+                        state, confidence = self.drowsiness_detector.analyze_frame(frame)
+                        self.drowsiness_state = state
+                        self.drowsiness_confidence = confidence
+                    except Exception as d_err:
+                        logger.debug(f"DeepFace drowsiness analysis error: {d_err}")
+
                     # Run DeepFace analysis at lower frequency
                     if now - self.last_analysis_time >= self.analysis_interval:
                         try:
@@ -1156,6 +1528,9 @@ class DeepFaceDriverMonitor:
                                     f"SAFETY STOP ACTIVATED - Critical stress: {stress_level:.2f}"
                                 )
 
+                            # High-stress audio alert
+                            self.handle_high_stress_audio(stress_level)
+
                             self.total_detections += 1
                             self.emotion_counts[self.current_emotion] += 1
 
@@ -1192,11 +1567,11 @@ class DeepFaceDriverMonitor:
                         )
 
                     self.calculate_fps()
+                    # Drowsiness audio based on latest state
+                    self.handle_drowsiness_audio(self.drowsiness_state)
                     self.draw_hud(frame)
 
                     title = "Driver Emotion & Stress Monitor (DeepFace)"
-                    if self.safety_stop_active:
-                        title += " - SAFETY STOP ACTIVE!"
                     cv2.imshow(title, frame)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -1299,6 +1674,11 @@ Examples:
         help="Disable automatic safety stop on critical stress",
     )
     parser.add_argument(
+        "--no-audio-alerts",
+        action="store_true",
+        help="Disable audio alerts for stress and drowsiness",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -1310,12 +1690,15 @@ Examples:
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    audio_manager = AudioAlertManager(enabled=not args.no_audio_alerts)
+
     if args.backend == "deepface":
         monitor = DeepFaceDriverMonitor(
             camera_id=args.camera,
             analysis_interval=1.0,
             save_frames=args.save_frames,
             enable_safety_stop=not args.no_safety_stop,
+            audio_manager=audio_manager,
         )
         monitor.run()
     else:
@@ -1324,6 +1707,7 @@ Examples:
             camera_id=args.camera,
             save_frames=args.save_frames,
             enable_safety_stop=not args.no_safety_stop,
+            audio_manager=audio_manager,
         )
         detector.run()
 

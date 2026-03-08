@@ -32,6 +32,8 @@ tensorflow          # for custom Keras backend
 opencv-python
 numpy
 deepface            # for DeepFace backend
+simpleaudio         # for audio alerts (cross-platform)
+mediapipe           # for drowsiness (eye/face landmarks)
 ```
 
 ## Usage
@@ -58,6 +60,7 @@ python main.py --backend custom --model best_emotion_model.keras
 | `--save-frames` | `-s` | `False` | Save frames with detected emotions (`detected_emotions/` or `detected_emotions_deepface/`) |
 | `--verbose` | `-v` | `False` | Enable verbose/debug logging |
 | `--no-safety-stop` | | `False` | Disable automatic safety stop on critical stress |
+| `--no-audio-alerts` | | `False` | Disable audio alerts for stress and drowsiness |
 
 ### Examples
 
@@ -76,6 +79,9 @@ python main.py --backend custom --model path/to/custom_model.keras
 
 # Use a different Keras model and disable safety stop
 python main.py --backend custom --model final_emotion_model.keras --no-safety-stop
+
+# Disable audio alerts (run silently)
+python main.py --no-audio-alerts
 
 # Enable verbose logging
 python main.py -v
