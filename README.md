@@ -25,6 +25,26 @@ Real-time facial emotion and stress detection using webcam with either:
 - **Stress Statistics** - Comprehensive stress level tracking and reporting
 - **Driver Safety Analysis** - Detailed safety report at session end
 
+## Project Architecture & How It Works
+
+The system continuously captures the webcam feed and processes it in real-time through several integrated AI pipelines to monitor driver state:
+
+1. **Face & Emotion Detection**
+   - **DeepFace Backend (Default)**: Uses the DeepFace library to locate faces and extract emotion probabilities.
+   - **Custom Keras Backend**: Detects faces using OpenCV Haar Cascades and passes the cropped face region to a trained DenseNet-based model for emotion classification across 8 categories.
+
+2. **Drowsiness Detection**
+   - Powered by **MediaPipe Face Landmarker**, it tracks the driver's facial landmarks.
+   - Calculates the **Eye Aspect Ratio (EAR)** in real-time. If the EAR falls below specific thresholds (e.g., `0.23` for drowsy, `0.18` for asleep) for a sustained period, alerts are triggered.
+
+3. **Stress Calculation engine**
+   - Converts the detected emotion probabilities into a weighted **Stress Score** (e.g., properties like Anger and Fear heavily increase stress, while Happiness reduces it).
+   - Uses a rolling window (30 frames) to average the score, preventing erratic fluctuations and categorizing stress into LOW, MODERATE, HIGH, or CRITICAL.
+
+4. **Safety & Alert Manager**
+   - **Audio Alerts**: Uses `simpleaudio` to emit distinct warning beeps (high-pitch for stress, low-pitch for drowsiness).
+   - **Safety Stop**: If critical stress or sleep status persists for more than 3 seconds, a "Safety Stop" mechanism is triggered, recording a visual/audio lockdown state on the HUD.
+
 ## Requirements
 
 ```
@@ -61,6 +81,8 @@ python main.py --backend custom --model best_emotion_model.keras
 | `--verbose` | `-v` | `False` | Enable verbose/debug logging |
 | `--no-safety-stop` | | `False` | Disable automatic safety stop on critical stress |
 | `--no-audio-alerts` | | `False` | Disable audio alerts for stress and drowsiness |
+| `--audio-high` | | `None` | Path to a custom `.wav` file for high-stress alerts |
+| `--audio-drowsy` | | `None` | Path to a custom `.wav` file for drowsiness alerts |
 
 ### Examples
 
@@ -83,11 +105,14 @@ python main.py --backend custom --model final_emotion_model.keras --no-safety-st
 # Disable audio alerts (run silently)
 python main.py --no-audio-alerts
 
+# Run with custom audio alerts
+python main.py --audio-high path/to/high_stress_alert.wav --audio-drowsy path/to/drowsy_alert.wav
+
 # Enable verbose logging
 python main.py -v
 
 # Combine multiple options
-python main.py -c 1 -s -v
+python main.py -c 1 -s -v --audio-high path/to/custom_alert.wav
 ```
 
 ## Keyboard Controls

@@ -21,9 +21,11 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 try:
-    import simpleaudio as _sa
+    import pygame
+    # Force pygame to hide its welcome message
+    os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 except ImportError:
-    _sa = None
+    pygame = None
 
 # Configure logging
 logging.basicConfig(
@@ -101,7 +103,7 @@ class DrowsinessState:
 
 class AudioAlertManager:
     """
-    Cross-platform audio alert helper using simpleaudio when available.
+    Cross-platform audio alert helper using pygame when available.
     Plays short beeps for:
       - High/critical stress
       - Drowsiness / sleeping
@@ -112,37 +114,91 @@ class AudioAlertManager:
         enabled: bool = True,
         min_interval_high_stress: float = 2.0,
         min_interval_drowsy: float = 2.0,
+        custom_audio_high: str | None = None,
+        custom_audio_drowsy: str | None = None,
     ) -> None:
-        self.enabled = enabled and (_sa is not None)
+        self.enabled = enabled and (pygame is not None)
         self.min_interval_high_stress = min_interval_high_stress
         self.min_interval_drowsy = min_interval_drowsy
         self._last_high_stress_play = 0.0
         self._last_drowsy_play = 0.0
 
-        # Pre-generate a short beep tone (440 Hz, 300 ms)
-        self._wave_obj_high = None
-        self._wave_obj_drowsy = None
+        self._sound_high = None
+        self._sound_drowsy = None
 
         if self.enabled:
+            # Initialize pygame mixer safely
             try:
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=2048)
+            except Exception as e:
+                logger.warning(f"Pygame mixer initialization failed: {e}")
+                self.enabled = False
+                return
+
+            # Default to alarm_audio.mp3 if it exists in current dir and arguments weren't provided
+            default_alarm_file = "alarm_audio.mp3"
+            
+            if custom_audio_high is None and os.path.exists(default_alarm_file):
+                custom_audio_high = default_alarm_file
+            
+            if custom_audio_drowsy is None and os.path.exists(default_alarm_file):
+                custom_audio_drowsy = default_alarm_file
+
+            # 1. Try loading custom audio for high stress
+            if custom_audio_high and os.path.exists(custom_audio_high):
+                try:
+                    self._sound_high = pygame.mixer.Sound(custom_audio_high)
+                    logger.info(f"Loaded custom high-stress audio from {custom_audio_high}")
+                except Exception as e:
+                    logger.error(f"Failed to load custom high-stress audio: {e}. Falling back to default.")
+
+            # 2. Try loading custom audio for drowsiness
+            if custom_audio_drowsy and os.path.exists(custom_audio_drowsy):
+                try:
+                    self._sound_drowsy = pygame.mixer.Sound(custom_audio_drowsy)
+                    logger.info(f"Loaded custom drowsy audio from {custom_audio_drowsy}")
+                except Exception as e:
+                    logger.error(f"Failed to load custom drowsy audio: {e}. Falling back to default.")
+
+            # 3. Generate defaults if custom loading failed or wasn't provided
+            try:
+                import wave
+                import tempfile
                 sample_rate = 44100
                 duration_s = 0.3
                 t = np.linspace(0, duration_s, int(sample_rate * duration_s), False)
 
-                # High-stress: higher pitch, louder
-                tone_high = 0.8 * np.sin(2 * np.pi * 880 * t)
-                audio_high = np.int16(tone_high * 32767)
+                if self._sound_high is None:
+                    tone_high = 0.8 * np.sin(2 * np.pi * 880 * t)
+                    audio_high = np.int16(tone_high * 32767)
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                        with wave.open(f, 'wb') as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(sample_rate)
+                            wf.writeframes(audio_high.tobytes())
+                        temp_path_high = f.name
+                    
+                    self._sound_high = pygame.mixer.Sound(temp_path_high)
+                    os.remove(temp_path_high)
 
-                # Drowsy: lower pitch, slightly softer
-                tone_drowsy = 0.6 * np.sin(2 * np.pi * 440 * t)
-                audio_drowsy = np.int16(tone_drowsy * 32767)
-
-                self._wave_obj_high = _sa.WaveObject(
-                    audio_high.tobytes(), 1, 2, sample_rate
-                )
-                self._wave_obj_drowsy = _sa.WaveObject(
-                    audio_drowsy.tobytes(), 1, 2, sample_rate
-                )
+                if self._sound_drowsy is None:
+                    tone_drowsy = 0.6 * np.sin(2 * np.pi * 440 * t)
+                    audio_drowsy = np.int16(tone_drowsy * 32767)
+                    
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                        with wave.open(f, 'wb') as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(sample_rate)
+                            wf.writeframes(audio_drowsy.tobytes())
+                        temp_path_drowsy = f.name
+                        
+                    self._sound_drowsy = pygame.mixer.Sound(temp_path_drowsy)
+                    os.remove(temp_path_drowsy)
+                    
             except Exception as e:
                 logger.warning(f"Audio initialization failed, disabling alerts: {e}")
                 self.enabled = False
@@ -153,24 +209,24 @@ class AudioAlertManager:
 
     def play_high_stress_alert(self) -> None:
         """Play an alert sound for high/critical stress."""
-        if not self.enabled or self._wave_obj_high is None:
+        if not self.enabled or self._sound_high is None:
             return
         if not self._can_play(self._last_high_stress_play, self.min_interval_high_stress):
             return
         try:
-            self._wave_obj_high.play()
+            self._sound_high.play()
             self._last_high_stress_play = time.time()
         except Exception as e:
             logger.debug(f"High-stress audio alert failed: {e}")
 
     def play_drowsy_alert(self) -> None:
         """Play an alert sound when driver is drowsy/sleeping."""
-        if not self.enabled or self._wave_obj_drowsy is None:
+        if not self.enabled or self._sound_drowsy is None:
             return
         if not self._can_play(self._last_drowsy_play, self.min_interval_drowsy):
             return
         try:
-            self._wave_obj_drowsy.play()
+            self._sound_drowsy.play()
             self._last_drowsy_play = time.time()
         except Exception as e:
             logger.debug(f"Drowsy audio alert failed: {e}")
@@ -1684,13 +1740,29 @@ Examples:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--audio-high",
+        type=str,
+        default=None,
+        help="Path to a custom .wav file for high stress auto alerts",
+    )
+    parser.add_argument(
+        "--audio-drowsy",
+        type=str,
+        default=None,
+        help="Path to a custom .wav file for drowsiness auto alerts",
+    )
 
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    audio_manager = AudioAlertManager(enabled=not args.no_audio_alerts)
+    audio_manager = AudioAlertManager(
+        enabled=not args.no_audio_alerts,
+        custom_audio_high=args.audio_high,
+        custom_audio_drowsy=args.audio_drowsy,
+    )
 
     if args.backend == "deepface":
         monitor = DeepFaceDriverMonitor(
